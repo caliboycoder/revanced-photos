@@ -14,6 +14,10 @@ on:
         description: 'Force release even if no version change'
         type: boolean
         default: false
+      force_notify:
+        description: 'Post the Telegram announcement even if this release already exists'
+        type: boolean
+        default: false
 
 concurrency:
   group: build-${{ github.ref }}
@@ -26,6 +30,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      is_new_release: ${{ steps.existing.outputs.is_new }}
 
     steps:
       - uses: actions/checkout@v4
@@ -118,6 +125,27 @@ jobs:
             output/release-notes.md
           retention-days: 7
 
+      # Must run BEFORE the release step: the weekly schedule and every push to main rebuild the same
+      # version, and only a release that did not exist yet should be announced on Telegram.
+      - name: Check whether this release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if out="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1)"; then
+            echo "Release $TAG already exists; it will be updated, not announced."
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+          elif echo "$out" | grep -qi "release not found"; then
+            echo "Release $TAG is new."
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not check for release $TAG: $out"
+            exit 1
+          fi
+
+      # Only one .apk is attached on purpose, so Obtainium (and users) have a single unambiguous
+      # file to pick. The signed copy under the long package-style name was an identical duplicate.
       - uses: softprops/action-gh-release@v2
         with:
           name: ${{ steps.meta.outputs.title }}
@@ -125,9 +153,16 @@ jobs:
           body_path: output/release-notes.md
           files: |
             output/GooglePhotos-v${{ steps.meta.outputs.version }}-PixelXL-unlimited.apk
-            output/com.google.android.apps.photos-morphe-signed.apk
             output/GooglePhotos-v${{ steps.meta.outputs.version }}-Magisk-module.zip
             output/magisk-revanced-gphotos.zip
             export-profile.json
             output/release-meta.json
           fail_on_unmatched_files: false
+
+  notify-telegram:
+    needs: build
+    if: needs.build.outputs.is_new_release == 'true' || inputs.force_notify
+    uses: ./.github/workflows/notify-telegram.yml
+    with:
+      tag: ${{ needs.build.outputs.tag }}
+    secrets: inherit

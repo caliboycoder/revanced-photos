@@ -1,0 +1,122 @@
+# Posts a release announcement to a Telegram channel: version, install steps, download links,
+# SHA-256 and an "Add to Obtainium" link so installed copies get update notifications.
+#
+# Runs automatically after build-and-release publishes a NEW release (see that workflow). To announce
+# an existing release again, either run this workflow by hand (leave the tag blank for the latest
+# release) or run build-and-release by hand with "Post the Telegram announcement" ticked.
+#
+# Setup (Settings -> Secrets and variables -> Actions -> New repository secret):
+#   TELEGRAM_BOT_TOKEN  token from @BotFather
+#   TELEGRAM_CHAT_ID    '@yourchannel' for a public channel, or the numeric id (-100...) for a private one
+# The bot must be added to the channel as an administrator with permission to post messages.
+# If either secret is missing the job logs a warning and does nothing.
+#
+# The APK is not uploaded to Telegram (the Bot API caps uploads at 50 MB); the message links to
+# the GitHub release instead.
+
+name: notify-telegram
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to announce'
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to announce, e.g. v7.97.0.997578476 (blank = latest release)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send release announcement to Telegram
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set. Skipping the Telegram post."
+            exit 0
+          fi
+
+          # Escape text that goes into the Telegram HTML message.
+          esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+          if [ -n "${TAG_INPUT:-}" ]; then
+            gh release view "$TAG_INPUT" --repo "$GITHUB_REPOSITORY" --json tagName,url,assets > release.json
+          else
+            gh release view --repo "$GITHUB_REPOSITORY" --json tagName,url,assets > release.json
+          fi
+
+          TAG="$(jq -r '.tagName' release.json)"
+          RELEASE_URL="$(jq -r '.url' release.json)"
+
+          # The installable file is the GooglePhotos-v<version>-PixelXL-unlimited.apk asset.
+          APK_NAME="$(jq -r '[.assets[] | select(.name | test("^GooglePhotos-v.*-PixelXL-unlimited\\.apk$")) | .name][0] // empty' release.json)"
+          if [ -z "$APK_NAME" ]; then
+            echo "::error::Release $TAG has no GooglePhotos-v*-PixelXL-unlimited.apk asset."
+            exit 1
+          fi
+          APK_URL="$(jq -r --arg n "$APK_NAME" '[.assets[] | select(.name == $n)][0].url' release.json)"
+          APK_BYTES="$(jq -r --arg n "$APK_NAME" '[.assets[] | select(.name == $n)][0].size' release.json)"
+          APK_MB="$(awk -v b="$APK_BYTES" 'BEGIN { printf "%.1f", b / 1048576 }')"
+
+          # Version and checksum come from release-meta.json (written by build.mjs) when it is attached.
+          VERSION=""
+          SHA256=""
+          if jq -e '.assets[] | select(.name == "release-meta.json")' release.json > /dev/null; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern release-meta.json --output meta.json
+            VERSION="$(jq -r '.version // empty' meta.json)"
+            SHA256="$(jq -r --arg n "$APK_NAME" '.assets.primaryApk | select(.fileName == $n) | .sha256 // empty' meta.json)"
+          fi
+          VERSION="${VERSION:-${TAG#v}}"
+
+          # Tapping this opens Obtainium's "add app" screen for this repo (the page falls back to a
+          # "get Obtainium" prompt when the app is not installed).
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}"
+          OBTAINIUM_URL="https://apps.obtainium.imranr.dev/redirect?r=$(jq -rn --arg s "obtainium://add/${REPO_URL}" '$s | @uri')"
+
+          {
+            printf '<b>Google Photos %s</b>\n' "$(printf '%s' "$VERSION" | esc)"
+            printf 'Patched build with the Pixel XL spoof for unlimited original-quality backup.\n\n'
+            printf '<b>Install</b>\n'
+            printf '1. Install GmsCore (<a href="https://github.com/ReVanced/GmsCore/releases">ReVanced GmsCore</a>) and sign in.\n'
+            printf '2. Install the APK: <code>%s</code>\n' "$(printf '%s' "$APK_NAME" | esc)"
+            printf '3. Set Google Photos and GmsCore battery mode to Unrestricted.\n\n'
+            printf '<b>Download</b>\n'
+            printf '<a href="%s">APK (%s MB)</a> | <a href="%s">Release page</a>\n' "$APK_URL" "$APK_MB" "$RELEASE_URL"
+            if [ -n "$SHA256" ]; then
+              printf 'SHA-256: <code>%s</code>\n' "$(printf '%s' "$SHA256" | esc)"
+            fi
+            printf '\n<b>Updates</b>\n'
+            printf 'Add the app to Obtainium once. It will notify you about new releases and install them.\n'
+            printf '<a href="%s">Add to Obtainium</a>\n' "$OBTAINIUM_URL"
+          } > message.html
+
+          echo "Message to send:"
+          cat message.html
+
+          curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode 'parse_mode=HTML' \
+            --data-urlencode 'link_preview_options={"is_disabled":true}' \
+            --data-urlencode 'text@message.html' > tg-response.json || {
+              echo "::error::Telegram API request failed:"
+              jq -r '.description // .' tg-response.json || cat tg-response.json
+              exit 1
+            }
+          echo "Posted to Telegram, message_id $(jq -r '.result.message_id' tg-response.json)"
