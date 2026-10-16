@@ -1,0 +1,164 @@
+# Posts a release announcement to a Telegram channel: version, install steps, download links,
+# SHA-256 and an "Add to Obtainium" link so installed copies get update notifications.
+#
+# This is a standalone workflow on purpose: it does not edit build-and-release.yml, so syncing this
+# fork with upstream cannot conflict with it.
+#
+# When it runs
+#   - Automatically after every build-and-release run that succeeds. It announces a release only if
+#     that run PUBLISHED it (the weekly schedule and pushes to main usually rebuild a version that
+#     already has a release, so they post nothing). No code from the build run is checked out.
+#   - By hand: Actions -> notify-telegram -> Run workflow. Leave the tag blank for the newest
+#     release, or enter one such as v7.97.0.997578476 to announce it again.
+#
+# If upstream ever renames the build-and-release workflow, update `workflows:` below to match,
+# otherwise the automatic trigger stops firing.
+#
+# Setup (Settings -> Secrets and variables -> Actions -> New repository secret):
+#   TELEGRAM_BOT_TOKEN  token from @BotFather
+#   TELEGRAM_CHAT_ID    '@yourchannel' for a public channel, or the numeric id (-100...) for a private one
+# The bot must be added to the channel as an administrator with permission to post messages.
+# If either secret is missing the job logs a warning and does nothing.
+#
+# The APK is not uploaded to Telegram (the Bot API caps uploads at 50 MB); the message links to
+# the GitHub release instead.
+
+name: notify-telegram
+
+on:
+  workflow_run:
+    workflows: ['build-and-release']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to announce, e.g. v7.97.0.997578476 (blank = newest release)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Find the release to announce
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" > releases.json
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "${TAG_INPUT:-}" ]; then
+              TAG="$TAG_INPUT"
+            else
+              TAG="$(jq -r 'map(select(.draft | not)) | sort_by(.published_at) | last | .tag_name // empty' releases.json)"
+            fi
+            if [ -z "$TAG" ]; then
+              echo "::error::No published release found to announce."
+              exit 1
+            fi
+          else
+            # published_at is when a release went public. (created_at is the commit date, and
+            # re-uploading files to an existing release leaves published_at unchanged.) So a release
+            # published after this build started was created by this build.
+            TAG="$(jq -r --arg since "$RUN_STARTED_AT" 'map(select((.draft | not) and (.published_at != null) and (.published_at >= $since))) | sort_by(.published_at) | last | .tag_name // empty' releases.json)"
+            if [ -z "$TAG" ]; then
+              echo "This build did not publish a new release (started $RUN_STARTED_AT), so there is nothing to announce."
+              echo "tag=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Announcing release $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Send release announcement to Telegram
+        if: steps.pick.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RELEASE_TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set. Skipping the Telegram post."
+            exit 0
+          fi
+
+          # Escape text that goes into the Telegram HTML message.
+          esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,url,assets > release.json
+
+          TAG="$(jq -r '.tagName' release.json)"
+          RELEASE_URL="$(jq -r '.url' release.json)"
+
+          # The installable file is the GooglePhotos-v<version>-PixelXL-unlimited.apk asset.
+          APK_NAME="$(jq -r '[.assets[] | select(.name | test("^GooglePhotos-v.*-PixelXL-unlimited\\.apk$")) | .name][0] // empty' release.json)"
+          if [ -z "$APK_NAME" ]; then
+            echo "::error::Release $TAG has no GooglePhotos-v*-PixelXL-unlimited.apk asset."
+            exit 1
+          fi
+          APK_URL="$(jq -r --arg n "$APK_NAME" '[.assets[] | select(.name == $n)][0].url' release.json)"
+          APK_BYTES="$(jq -r --arg n "$APK_NAME" '[.assets[] | select(.name == $n)][0].size' release.json)"
+          APK_MB="$(awk -v b="$APK_BYTES" 'BEGIN { printf "%.1f", b / 1048576 }')"
+
+          # Version and checksum come from release-meta.json (written by build.mjs) when it is attached.
+          VERSION=""
+          SHA256=""
+          if jq -e '.assets[] | select(.name == "release-meta.json")' release.json > /dev/null; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern release-meta.json --output meta.json
+            VERSION="$(jq -r '.version // empty' meta.json)"
+            SHA256="$(jq -r --arg n "$APK_NAME" '.assets.primaryApk | select(.fileName == $n) | .sha256 // empty' meta.json)"
+          fi
+          VERSION="${VERSION:-${TAG#v}}"
+
+          # Tapping this opens Obtainium's "add app" screen for this repo (the page falls back to a
+          # "get Obtainium" prompt when the app is not installed).
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}"
+          OBTAINIUM_URL="https://apps.obtainium.imranr.dev/redirect?r=$(jq -rn --arg s "obtainium://add/${REPO_URL}" '$s | @uri')"
+
+          {
+            printf '<b>Google Photos %s</b>\n' "$(printf '%s' "$VERSION" | esc)"
+            printf 'Patched build with the Pixel XL spoof for unlimited original-quality backup.\n\n'
+            printf '<b>Install</b>\n'
+            printf '1. Install GmsCore (<a href="https://github.com/ReVanced/GmsCore/releases">ReVanced GmsCore</a>) and sign in.\n'
+            printf '2. Install the APK: <code>%s</code>\n' "$(printf '%s' "$APK_NAME" | esc)"
+            printf '3. Set Google Photos and GmsCore battery mode to Unrestricted.\n\n'
+            printf '<b>Download</b>\n'
+            printf '<a href="%s">APK (%s MB)</a> | <a href="%s">Release page</a>\n' "$APK_URL" "$APK_MB" "$RELEASE_URL"
+            if [ -n "$SHA256" ]; then
+              printf 'SHA-256: <code>%s</code>\n' "$(printf '%s' "$SHA256" | esc)"
+            fi
+            printf '\n<b>Updates</b>\n'
+            printf 'Add the app to Obtainium once. It will notify you about new releases and install them.\n'
+            printf 'If it asks which file to use, pick the one ending in -PixelXL-unlimited.apk.\n'
+            printf '<a href="%s">Add to Obtainium</a>\n' "$OBTAINIUM_URL"
+          } > message.html
+
+          echo "Message to send:"
+          cat message.html
+
+          curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode 'parse_mode=HTML' \
+            --data-urlencode 'link_preview_options={"is_disabled":true}' \
+            --data-urlencode 'text@message.html' > tg-response.json || {
+              echo "::error::Telegram API request failed:"
+              jq -r '.description // .' tg-response.json || cat tg-response.json
+              exit 1
+            }
+          echo "Posted to Telegram, message_id $(jq -r '.result.message_id' tg-response.json)"
